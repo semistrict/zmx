@@ -26,7 +26,8 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
     options.addOption([]const u8, "git_sha", git_sha);
-    const ghostty_ver = @import("build.zig.zon").dependencies.ghostty.hash;
+    const ghostty_dep = @import("build.zig.zon").dependencies.ghostty;
+    const ghostty_ver = if (@hasField(@TypeOf(ghostty_dep), "hash")) ghostty_dep.hash else "local";
     options.addOption([]const u8, "ghostty_version", ghostty_ver);
 
     const exe_mod = b.createModule(.{
@@ -39,6 +40,7 @@ pub fn build(b: *std.Build) void {
     if (b.lazyDependency("ghostty", .{
         .target = target,
         .optimize = optimize,
+        .@"emit-lib-vt" = true,
     })) |dep| {
         exe_mod.addImport(
             "ghostty-vt",
@@ -72,6 +74,7 @@ pub fn build(b: *std.Build) void {
         if (b.lazyDependency("ghostty", .{
             .target = target,
             .optimize = optimize,
+            .@"emit-lib-vt" = true,
         })) |dep| {
             test_module.addImport(
                 "ghostty-vt",
@@ -121,6 +124,7 @@ pub fn build(b: *std.Build) void {
             if (b.lazyDependency("ghostty", .{
                 .target = resolved,
                 .optimize = .ReleaseSafe,
+                .@"emit-lib-vt" = true,
             })) |dep| {
                 release_mod.addImport("ghostty-vt", dep.module("ghostty-vt"));
             }

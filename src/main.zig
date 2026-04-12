@@ -91,11 +91,12 @@ pub fn main() !void {
         const sesh = try socket.getSeshName(alloc, session_name orelse sesh_env);
         defer alloc.free(sesh);
         return history(&cfg, sesh, format);
-    } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
+    } else if (std.mem.eql(u8, cmd, "start") or std.mem.eql(u8, cmd, "s")) {
         const session_name = args.next() orelse "";
 
         var command_args: std.ArrayList([]const u8) = .empty;
         defer command_args.deinit(alloc);
+
         while (args.next()) |arg| {
             try command_args.append(alloc, arg);
         }
@@ -123,6 +124,49 @@ pub fn main() !void {
             .cwd = cwd,
             .created_at = @intCast(std.time.timestamp()),
             .leader_client_fd = null,
+            .defer_shell = true,
+        };
+        daemon.socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
+            error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
+            error.OutOfMemory => return err,
+        };
+        std.log.info("socket path={s}", .{daemon.socket_path});
+        return start(&daemon);
+    } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
+        const session_name = args.next() orelse "";
+
+        var command_args: std.ArrayList([]const u8) = .empty;
+        defer command_args.deinit(alloc);
+        while (args.next()) |arg| {
+            try command_args.append(alloc, arg);
+        }
+
+        const clients = try std.ArrayList(*Client).initCapacity(alloc, 10);
+        var command: ?[][]const u8 = null;
+        if (command_args.items.len > 0) {
+            command = command_args.items;
+        }
+
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = std.posix.getcwd(&cwd_buf) catch "";
+
+        const term_size = ipc.getTerminalSize(posix.STDOUT_FILENO);
+        const sesh = try socket.getSeshName(alloc, session_name);
+        defer alloc.free(sesh);
+        var daemon = Daemon{
+            .running = true,
+            .cfg = &cfg,
+            .alloc = alloc,
+            .clients = clients,
+            .session_name = sesh,
+            .socket_path = undefined,
+            .pid = undefined,
+            .command = command,
+            .cwd = cwd,
+            .created_at = @intCast(std.time.timestamp()),
+            .leader_client_fd = null,
+            .initial_cols = term_size.cols,
+            .initial_rows = term_size.rows,
         };
         daemon.socket_path = socket.getSocketPath(alloc, cfg.socket_dir, sesh) catch |err| switch (err) {
             error.NameTooLong => return socket.printSessionNameTooLong(sesh, cfg.socket_dir),
@@ -348,6 +392,9 @@ const Daemon = struct {
     task_ended_at: ?u64 = null, // timestamp when task exited
     task_command: ?[]const []const u8 = null,
     pty_write_buf: std.ArrayList(u8) = .empty,
+    initial_cols: u16 = 80,
+    initial_rows: u16 = 24,
+    defer_shell: bool = false,
 
     const EnsureSessionResult = struct {
         created: bool,
@@ -442,10 +489,9 @@ const Daemon = struct {
 
     /// spawnPty runs forkpty() and executes the shell or shell command the user provides.
     fn spawnPty(self: *Daemon) !c_int {
-        const size = ipc.getTerminalSize(posix.STDOUT_FILENO);
         var ws: cross.c.struct_winsize = .{
-            .ws_row = size.rows,
-            .ws_col = size.cols,
+            .ws_row = self.initial_rows,
+            .ws_col = self.initial_cols,
             .ws_xpixel = 0,
             .ws_ypixel = 0,
         };
@@ -537,28 +583,46 @@ const Daemon = struct {
                 defer self.alloc.free(session_log_path);
                 try log_system.init(self.alloc, session_log_path);
 
-                // If spawnPty fails, clean up here. Once it succeeds,
-                // the inner block's defer takes ownership of cleanup to
-                // avoid double-closing server_sock_fd on daemonLoop error.
-                const pty_fd = self.spawnPty() catch |err| {
-                    posix.close(server_sock_fd);
-                    dir.deleteFile(self.session_name) catch {};
-                    return err;
-                };
-
-                defer {
-                    self.handleKill();
-                    self.deinit();
-                    posix.close(pty_fd);
-                    _ = posix.waitpid(self.pid, 0);
-                    posix.close(server_sock_fd);
-                    std.log.info("deleting socket file session={s}", .{self.session_name});
-                    dir.deleteFile(self.session_name) catch |err| {
-                        std.log.warn("failed to delete socket file err={s}", .{@errorName(err)});
+                if (self.defer_shell) {
+                    // Shell deferred: daemon starts without a PTY.
+                    // The first client Init will provide dimensions and spawn the shell.
+                    defer {
+                        self.handleKill();
+                        self.deinit();
+                        if (self.pid > 0) {
+                            _ = posix.waitpid(self.pid, 0);
+                        }
+                        posix.close(server_sock_fd);
+                        std.log.info("deleting socket file session={s}", .{self.session_name});
+                        dir.deleteFile(self.session_name) catch |err| {
+                            std.log.warn("failed to delete socket file err={s}", .{@errorName(err)});
+                        };
+                    }
+                    self.pid = 0;
+                    try daemonLoop(self, server_sock_fd, null);
+                } else {
+                    // If spawnPty fails, clean up here. Once it succeeds,
+                    // the inner block's defer takes ownership of cleanup to
+                    // avoid double-closing server_sock_fd on daemonLoop error.
+                    const pty_fd = self.spawnPty() catch |err| {
+                        posix.close(server_sock_fd);
+                        dir.deleteFile(self.session_name) catch {};
+                        return err;
                     };
-                }
 
-                try daemonLoop(self, server_sock_fd, pty_fd);
+                    defer {
+                        self.handleKill();
+                        self.deinit();
+                        posix.close(pty_fd);
+                        _ = posix.waitpid(self.pid, 0);
+                        posix.close(server_sock_fd);
+                        std.log.info("deleting socket file session={s}", .{self.session_name});
+                        dir.deleteFile(self.session_name) catch |err| {
+                            std.log.warn("failed to delete socket file err={s}", .{@errorName(err)});
+                        };
+                    }
+                    try daemonLoop(self, server_sock_fd, pty_fd);
+                }
                 return .{ .created = true, .is_daemon = true };
             }
             posix.close(server_sock_fd);
@@ -642,9 +706,7 @@ const Daemon = struct {
         // Serialize terminal state BEFORE resize to capture correct cursor position.
         // Resizing triggers reflow which can move the cursor, and the shell's
         // SIGWINCH-triggered redraw will run after our snapshot is sent.
-        // Only serialize on re-attach (has_had_client), not first attach, to avoid
-        // interfering with shell initialization (DA1 queries, etc.)
-        if (self.has_pty_output and self.has_had_client) {
+        if (self.has_pty_output) {
             const cursor = &term.screens.active.cursor;
             std.log.debug(
                 "cursor before serialize: x={d} y={d} pending_wrap={}",
@@ -873,6 +935,7 @@ fn help() !void {
         \\Usage: zmx <command> [args]
         \\
         \\Commands:
+        \\  [s]tart <name> [command...]    Start session daemon and exit (--cols, --rows for initial size)
         \\  [a]ttach <name> [command...]   Attach to session, creating session if needed
         \\  [r]un <name> [command...]      Send command without attaching, creating session if needed
         \\  [d]etach                       Detach all clients from current session (ctrl+\ for current client)
@@ -1218,6 +1281,16 @@ fn switchSesh(daemon: *Daemon, current_sesh: []const u8) !void {
         error.BrokenPipe, error.ConnectionResetByPeer => return,
         else => return err,
     };
+}
+
+fn start(daemon: *Daemon) !void {
+    const result = try daemon.ensureSession();
+    if (result.is_daemon) return;
+
+    var buf: [4096]u8 = undefined;
+    var w = std.fs.File.stdout().writer(&buf);
+    try w.interface.print("{s}\n", .{daemon.socket_path});
+    try w.interface.flush();
 }
 
 fn attach(daemon: *Daemon) !void {
@@ -1642,16 +1715,27 @@ fn clientLoop(client_sock_fd: i32) !ClientResult {
 
 /// dameonLoop is what the daemon runs to send and receive ipc commands from its corresponding
 /// clients.  It uses poll() as its non-blocking mechanism.
-fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
-    std.log.info("daemon started session={s} pty_fd={d}", .{ daemon.session_name, pty_fd });
+/// When initial_pty_fd is null (defer_shell mode), the daemon waits for the first client
+/// Init to provide terminal dimensions before spawning the PTY.
+fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, initial_pty_fd: ?i32) !void {
+    std.log.info("daemon started session={s} pty_fd={any}", .{ daemon.session_name, initial_pty_fd });
     setupSigtermHandler();
     var poll_fds = try std.ArrayList(posix.pollfd).initCapacity(daemon.alloc, 8);
     defer poll_fds.deinit(daemon.alloc);
 
-    const init_size = ipc.getTerminalSize(pty_fd);
+    var pty_fd: i32 = initial_pty_fd orelse -1;
+    var pty_live = initial_pty_fd != null;
+    // Cleanup for deferred PTY: if we spawn it later, we need to close it on exit.
+    defer if (initial_pty_fd == null and pty_live) {
+        posix.close(pty_fd);
+        _ = posix.waitpid(daemon.pid, 0);
+    };
+
+    const init_cols: u16 = if (pty_live) ipc.getTerminalSize(pty_fd).cols else 80;
+    const init_rows: u16 = if (pty_live) ipc.getTerminalSize(pty_fd).rows else 24;
     var term = try ghostty_vt.Terminal.init(daemon.alloc, .{
-        .cols = init_size.cols,
-        .rows = init_size.rows,
+        .cols = init_cols,
+        .rows = init_rows,
         .max_scrollback = daemon.cfg.max_scrollback,
     });
     defer term.deinit(daemon.alloc);
@@ -1675,15 +1759,17 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
             .revents = 0,
         });
 
-        var pty_events: i16 = posix.POLL.IN;
-        if (daemon.pty_write_buf.items.len > 0) {
-            pty_events |= posix.POLL.OUT;
+        if (pty_live) {
+            var pty_events: i16 = posix.POLL.IN;
+            if (daemon.pty_write_buf.items.len > 0) {
+                pty_events |= posix.POLL.OUT;
+            }
+            try poll_fds.append(daemon.alloc, .{
+                .fd = pty_fd,
+                .events = pty_events,
+                .revents = 0,
+            });
         }
-        try poll_fds.append(daemon.alloc, .{
-            .fd = pty_fd,
-            .events = pty_events,
-            .revents = 0,
-        });
 
         for (daemon.clients.items) |client| {
             var events: i16 = posix.POLL.IN;
@@ -1727,81 +1813,85 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
             );
         }
 
-        const inp_flags = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL;
-        if (poll_fds.items[1].revents & inp_flags != 0) {
-            // Read from PTY
-            var buf: [4096]u8 = undefined;
-            const n_opt: ?usize = posix.read(pty_fd, &buf) catch |err| blk: {
-                if (err == error.WouldBlock) break :blk null;
-                break :blk 0;
-            };
+        // poll_fds layout: [server, pty?, client0, client1, ...]
+        // When pty_live is false, the pty entry is absent.
+        const client_poll_offset: usize = if (pty_live) 2 else 1;
 
-            if (n_opt) |n| {
-                if (n == 0) {
-                    // EOF: Shell exited
-                    std.log.info("shell exited pty_fd={d}", .{pty_fd});
-                    break :daemon_loop;
-                } else {
-                    // Feed PTY output to terminal emulator for state tracking
-                    try vt_stream.nextSlice(buf[0..n]);
-                    daemon.has_pty_output = true;
+        if (pty_live) {
+            const inp_flags = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL;
+            if (poll_fds.items[1].revents & inp_flags != 0) {
+                // Read from PTY
+                var buf: [4096]u8 = undefined;
+                const n_opt: ?usize = posix.read(pty_fd, &buf) catch |err| blk: {
+                    if (err == error.WouldBlock) break :blk null;
+                    break :blk 0;
+                };
 
-                    // When no clients are attached, respond to terminal
-                    // queries (e.g. DA1/DA2) on behalf of the terminal.
-                    // This prevents shells like from fish from waiting 2s
-                    // and then sending a no DA query response warning because
-                    // there's no client terminal to respond to the query.
-                    if (daemon.clients.items.len == 0 and
-                        daemon.pty_write_buf.items.len < Daemon.PTY_WRITE_BUF_MAX)
-                    {
-                        util.respondToDeviceAttributes(daemon.alloc, &daemon.pty_write_buf, buf[0..n]);
-                    }
+                if (n_opt) |n| {
+                    if (n == 0) {
+                        // EOF: Shell exited
+                        std.log.info("shell exited pty_fd={d}", .{pty_fd});
+                        break :daemon_loop;
+                    } else {
+                        // Feed PTY output to terminal emulator for state tracking
+                        vt_stream.nextSlice(buf[0..n]);
+                        daemon.has_pty_output = true;
 
-                    // In run mode, scan output for exit code marker
-                    if (daemon.is_task_mode and daemon.task_exit_code == null) {
-                        if (util.findTaskExitMarker(buf[0..n])) |exit_code| {
-                            daemon.task_exit_code = exit_code;
-                            daemon.task_ended_at = @intCast(std.time.timestamp());
-
-                            std.log.info("task completed exit_code={d}", .{exit_code});
-                            // Shell continues running - no break here
+                        // When no clients are attached, respond to terminal
+                        // queries (e.g. DA1/DA2) on behalf of the terminal.
+                        // This prevents shells like from fish from waiting 2s
+                        // and then sending a no DA query response warning because
+                        // there's no client terminal to respond to the query.
+                        if (daemon.clients.items.len == 0 and
+                            daemon.pty_write_buf.items.len < Daemon.PTY_WRITE_BUF_MAX)
+                        {
+                            util.respondToDeviceAttributes(daemon.alloc, &daemon.pty_write_buf, buf[0..n]);
                         }
-                    }
 
-                    // Broadcast data to all clients
-                    for (daemon.clients.items) |client| {
-                        ipc.appendMessage(daemon.alloc, &client.write_buf, .Output, buf[0..n]) catch |err| {
-                            std.log.warn(
-                                "failed to buffer output for client err={s}",
-                                .{@errorName(err)},
-                            );
-                            continue;
-                        };
-                        client.has_pending_output = true;
+                        // In run mode, scan output for exit code marker
+                        if (daemon.is_task_mode and daemon.task_exit_code == null) {
+                            if (util.findTaskExitMarker(buf[0..n])) |exit_code| {
+                                daemon.task_exit_code = exit_code;
+                                daemon.task_ended_at = @intCast(std.time.timestamp());
+
+                                std.log.info("task completed exit_code={d}", .{exit_code});
+                                // Shell continues running - no break here
+                            }
+                        }
+
+                        // Broadcast data to all clients
+                        for (daemon.clients.items) |client| {
+                            ipc.appendMessage(daemon.alloc, &client.write_buf, .Output, buf[0..n]) catch |err| {
+                                std.log.warn(
+                                    "failed to buffer output for client err={s}",
+                                    .{@errorName(err)},
+                                );
+                                continue;
+                            };
+                            client.has_pending_output = true;
+                        }
                     }
                 }
             }
-        }
 
-        if (poll_fds.items[1].revents & posix.POLL.OUT != 0) {
-            while (daemon.pty_write_buf.items.len > 0) {
-                const n = posix.write(pty_fd, daemon.pty_write_buf.items) catch |err| {
-                    if (err != error.WouldBlock) {
-                        std.log.warn("pty write failed: {s}", .{@errorName(err)});
-                        daemon.pty_write_buf.clearRetainingCapacity();
-                    }
-                    break;
-                };
-                if (n == 0) break;
-                daemon.pty_write_buf.replaceRange(daemon.alloc, 0, n, &[_]u8{}) catch unreachable;
+            if (poll_fds.items[1].revents & posix.POLL.OUT != 0) {
+                while (daemon.pty_write_buf.items.len > 0) {
+                    const n = posix.write(pty_fd, daemon.pty_write_buf.items) catch |err| {
+                        if (err != error.WouldBlock) {
+                            std.log.warn("pty write failed: {s}", .{@errorName(err)});
+                            daemon.pty_write_buf.clearRetainingCapacity();
+                        }
+                        break;
+                    };
+                    if (n == 0) break;
+                    daemon.pty_write_buf.replaceRange(daemon.alloc, 0, n, &[_]u8{}) catch unreachable;
+                }
             }
         }
 
         var i: usize = daemon.clients.items.len;
         // Only iterate over clients that were present when poll_fds was constructed
-        // poll_fds contains [server, pty, client0, client1, ...]
-        // So number of clients in poll_fds is poll_fds.items.len - 2
-        const num_polled_clients = poll_fds.items.len - 2;
+        const num_polled_clients = poll_fds.items.len - client_poll_offset;
         if (i > num_polled_clients) {
             // If we have more clients than polled (i.e. we just accepted one), start from the
             // polled ones
@@ -1811,7 +1901,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
         clients_loop: while (i > 0) {
             i -= 1;
             const client = daemon.clients.items[i];
-            const revents = poll_fds.items[i + 2].revents;
+            const revents = poll_fds.items[i + client_poll_offset].revents;
 
             if (revents & posix.POLL.IN != 0) {
                 const n = client.read_buf.read(client.socket_fd) catch |err| {
@@ -1834,10 +1924,22 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
 
                 while (client.read_buf.next()) |msg| {
                     switch (msg.header.tag) {
-                        .Input => try daemon.handleInput(client, msg.payload),
-                        .Init => try daemon.handleInit(client, pty_fd, &term, msg.payload),
+                        .Input => if (pty_live) try daemon.handleInput(client, msg.payload),
+                        .Init => {
+                            // If shell was deferred, spawn it now with the client's dimensions.
+                            if (!pty_live and msg.payload.len == @sizeOf(ipc.Resize)) {
+                                const resize = std.mem.bytesToValue(ipc.Resize, msg.payload[0..@sizeOf(ipc.Resize)]);
+                                daemon.initial_cols = resize.cols;
+                                daemon.initial_rows = resize.rows;
+                                try term.resize(daemon.alloc, resize.cols, resize.rows);
+                                std.log.info("deferred shell spawn cols={d} rows={d}", .{ resize.cols, resize.rows });
+                                pty_fd = try daemon.spawnPty();
+                                pty_live = true;
+                            }
+                            try daemon.handleInit(client, pty_fd, &term, msg.payload);
+                        },
                         .Switch => try daemon.handleSwitch(msg.payload),
-                        .Resize => try daemon.handleResize(client, pty_fd, &term, msg.payload),
+                        .Resize => if (pty_live) try daemon.handleResize(client, pty_fd, &term, msg.payload),
                         .Detach => {
                             daemon.handleDetach(client, i);
                             break :clients_loop;
