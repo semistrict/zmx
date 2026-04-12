@@ -4,6 +4,7 @@ const ghostty_vt = @import("ghostty-vt");
 const ipc = @import("ipc.zig");
 const socket = @import("socket.zig");
 const testing = std.testing;
+const zstd = @cImport(@cInclude("zstd.h"));
 
 pub const SessionEntry = struct {
     name: []const u8,
@@ -444,6 +445,21 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
         std.log.warn("failed to allocate terminal state err={s}", .{@errorName(err)});
         return null;
     };
+}
+
+/// Compress data with zstd. Returns null on failure.
+pub fn compressZstd(alloc: std.mem.Allocator, input: []const u8) ?[]const u8 {
+    const bound = zstd.ZSTD_compressBound(input.len);
+    if (zstd.ZSTD_isError(bound) != 0) return null;
+
+    const output = alloc.alloc(u8, bound) catch return null;
+    const result = zstd.ZSTD_compress(output.ptr, output.len, input.ptr, input.len, 1);
+    if (zstd.ZSTD_isError(result) != 0) {
+        alloc.free(output);
+        return null;
+    }
+
+    return output[0..result];
 }
 
 pub const HistoryFormat = enum(u8) {

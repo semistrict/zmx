@@ -713,14 +713,25 @@ const Daemon = struct {
                 .{ cursor.x, cursor.y, cursor.pending_wrap },
             );
             if (util.serializeTerminalState(self.alloc, term)) |term_output| {
-                std.log.debug("serialize terminal state", .{});
+                std.log.debug("serialize terminal state len={d}", .{term_output.len});
                 defer self.alloc.free(term_output);
-                ipc.appendMessage(self.alloc, &client.write_buf, .Output, term_output) catch |err| {
-                    std.log.warn(
-                        "failed to buffer terminal state for client err={s}",
-                        .{@errorName(err)},
-                    );
-                };
+                if (term_output.len > 4096) {
+                    if (util.compressZstd(self.alloc, term_output)) |compressed| {
+                        defer self.alloc.free(compressed);
+                        std.log.debug("zstd compressed terminal state {d} -> {d}", .{ term_output.len, compressed.len });
+                        ipc.appendMessage(self.alloc, &client.write_buf, .CompressedOutput, compressed) catch |err| {
+                            std.log.warn("failed to buffer compressed state err={s}", .{@errorName(err)});
+                        };
+                    } else {
+                        ipc.appendMessage(self.alloc, &client.write_buf, .Output, term_output) catch |err| {
+                            std.log.warn("failed to buffer terminal state err={s}", .{@errorName(err)});
+                        };
+                    }
+                } else {
+                    ipc.appendMessage(self.alloc, &client.write_buf, .Output, term_output) catch |err| {
+                        std.log.warn("failed to buffer terminal state err={s}", .{@errorName(err)});
+                    };
+                }
                 client.has_pending_output = true;
             }
         }
@@ -1954,7 +1965,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, initial_pty_fd: ?i32) !void 
                         .Info => try daemon.handleInfo(client),
                         .History => try daemon.handleHistory(client, &term, msg.payload),
                         .Run => try daemon.handleRun(client, msg.payload),
-                        .Output, .Ack => {},
+                        .Output, .CompressedOutput, .Ack => {},
                         _ => std.log.warn(
                             "ignoring unknown IPC tag={d}",
                             .{@intFromEnum(msg.header.tag)},
@@ -1963,8 +1974,12 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, initial_pty_fd: ?i32) !void 
                 }
             }
 
-            if (revents & posix.POLL.OUT != 0) {
-                // Flush pending output buffers
+            // Flush pending output: try to write whenever there is buffered data,
+            // not only when POLLOUT fires. Message processing (e.g. Init) can
+            // buffer a response in the same iteration, but POLLOUT wasn't
+            // requested in the poll_fds built before that response existed.
+            // The client socket is non-blocking, so WouldBlock is safe.
+            if (client.has_pending_output) {
                 const n = posix.write(client.socket_fd, client.write_buf.items) catch |err| blk: {
                     if (err == error.WouldBlock) break :blk 0;
                     // Error on write, close client
