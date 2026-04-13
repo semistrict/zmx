@@ -1845,7 +1845,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, initial_pty_fd: ?i32) !void 
                         break :daemon_loop;
                     } else {
                         // Feed PTY output to terminal emulator for state tracking
-                        vt_stream.nextSlice(buf[0..n]);
+                        try vt_stream.nextSlice(buf[0..n]);
                         daemon.has_pty_output = true;
 
                         // When no clients are attached, respond to terminal
