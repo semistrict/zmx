@@ -94,18 +94,7 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, cmd, "start") or std.mem.eql(u8, cmd, "s")) {
         const session_name = args.next() orelse "";
 
-        var command_args: std.ArrayList([]const u8) = .empty;
-        defer command_args.deinit(alloc);
-
-        while (args.next()) |arg| {
-            try command_args.append(alloc, arg);
-        }
-
         const clients = try std.ArrayList(*Client).initCapacity(alloc, 10);
-        var command: ?[][]const u8 = null;
-        if (command_args.items.len > 0) {
-            command = command_args.items;
-        }
 
         var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
         const cwd = std.posix.getcwd(&cwd_buf) catch "";
@@ -120,7 +109,7 @@ pub fn main() !void {
             .session_name = sesh,
             .socket_path = undefined,
             .pid = undefined,
-            .command = command,
+            .command = null,
             .cwd = cwd,
             .created_at = @intCast(std.time.timestamp()),
             .leader_client_fd = null,
@@ -325,6 +314,10 @@ const Cfg = struct {
             .log_dir = log_dir,
         };
 
+        if (posix.getenv("ZMX_MAX_SCROLLBACK")) |val| {
+            cfg.max_scrollback = std.fmt.parseInt(usize, val, 10) catch 10_000_000;
+        }
+
         try cfg.mkdir();
 
         return cfg;
@@ -395,6 +388,9 @@ const Daemon = struct {
     initial_cols: u16 = 80,
     initial_rows: u16 = 24,
     defer_shell: bool = false,
+    auto_restart: bool = false,
+    restart_count: u32 = 0,
+    last_spawn_at: i64 = 0,
 
     const EnsureSessionResult = struct {
         created: bool,
@@ -515,6 +511,7 @@ const Daemon = struct {
         }
         // master pid code path
         self.pid = pid;
+        self.last_spawn_at = std.time.timestamp();
         std.log.info("pty spawned session={s} pid={d}", .{ self.session_name, pid });
 
         // make pty non-blocking
@@ -701,7 +698,7 @@ const Daemon = struct {
         term: *ghostty_vt.Terminal,
         payload: []const u8,
     ) !void {
-        if (payload.len != @sizeOf(ipc.Resize)) return;
+        if (payload.len < @sizeOf(ipc.Resize)) return;
 
         // Serialize terminal state BEFORE resize to capture correct cursor position.
         // Resizing triggers reflow which can move the cursor, and the shell's
@@ -917,6 +914,28 @@ const Daemon = struct {
     }
 };
 
+/// Parse a NUL-separated byte sequence into an argv slice.
+/// E.g. "claude\x00--model\x00opus" → ["claude", "--model", "opus"]
+fn parseNulArgv(alloc: std.mem.Allocator, data: []const u8) ?[]const []const u8 {
+    var count: usize = 0;
+    var it = std.mem.splitScalar(u8, data, 0);
+    while (it.next()) |part| {
+        if (part.len > 0) count += 1;
+    }
+    if (count == 0) return null;
+
+    const argv = alloc.alloc([]const u8, count) catch return null;
+    var i: usize = 0;
+    it = std.mem.splitScalar(u8, data, 0);
+    while (it.next()) |part| {
+        if (part.len > 0) {
+            argv[i] = alloc.dupe(u8, part) catch return null;
+            i += 1;
+        }
+    }
+    return argv;
+}
+
 fn printVersion(cfg: *Cfg) !void {
     var buf: [256]u8 = undefined;
     var w = std.fs.File.stdout().writer(&buf);
@@ -946,7 +965,7 @@ fn help() !void {
         \\Usage: zmx <command> [args]
         \\
         \\Commands:
-        \\  [s]tart <name> [command...]    Start session daemon and exit (--cols, --rows for initial size)
+        \\  [s]tart <name>                 Start session daemon and exit (command via Init IPC)
         \\  [a]ttach <name> [command...]   Attach to session, creating session if needed
         \\  [r]un <name> [command...]      Send command without attaching, creating session if needed
         \\  [d]etach                       Detach all clients from current session (ctrl+\ for current client)
@@ -1832,7 +1851,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, initial_pty_fd: ?i32) !void 
             const inp_flags = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL;
             if (poll_fds.items[1].revents & inp_flags != 0) {
                 // Read from PTY
-                var buf: [4096]u8 = undefined;
+                var buf: [65536]u8 = undefined;
                 const n_opt: ?usize = posix.read(pty_fd, &buf) catch |err| blk: {
                     if (err == error.WouldBlock) break :blk null;
                     break :blk 0;
@@ -1841,6 +1860,43 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, initial_pty_fd: ?i32) !void 
                 if (n_opt) |n| {
                     if (n == 0) {
                         // EOF: Shell exited
+                        if (daemon.auto_restart and daemon.running) {
+                            _ = posix.waitpid(daemon.pid, 0);
+                            // Reset backoff when the process ran long enough (>30s)
+                            const uptime = std.time.timestamp() - daemon.last_spawn_at;
+                            if (uptime > 30) {
+                                daemon.restart_count = 0;
+                            }
+                            // Exponential backoff: 1s, 2s, 4s, 8s, ... capped at 300s (5 min)
+                            const delay_s: u64 = @min(
+                                300,
+                                @as(u64, 1) << @intCast(@min(daemon.restart_count, 8)),
+                            );
+                            daemon.restart_count += 1;
+                            std.log.info(
+                                "auto-restart in {d}s (attempt {d}) pty_fd={d}",
+                                .{ delay_s, daemon.restart_count, pty_fd },
+                            );
+                            // Notify clients that the process exited
+                            for (daemon.clients.items) |client| {
+                                const msg = std.fmt.allocPrint(
+                                    daemon.alloc,
+                                    "\r\n\x1b[2m[process exited, restarting in {d}s]\x1b[0m\r\n",
+                                    .{delay_s},
+                                ) catch continue;
+                                defer daemon.alloc.free(msg);
+                                ipc.appendMessage(daemon.alloc, &client.write_buf, .Output, msg) catch {};
+                                client.has_pending_output = true;
+                            }
+                            posix.close(pty_fd);
+                            std.Thread.sleep(delay_s * std.time.ns_per_s);
+                            if (!daemon.running) break :daemon_loop;
+                            pty_fd = daemon.spawnPty() catch {
+                                std.log.err("auto-restart spawn failed", .{});
+                                break :daemon_loop;
+                            };
+                            continue :daemon_loop;
+                        }
                         std.log.info("shell exited pty_fd={d}", .{pty_fd});
                         break :daemon_loop;
                     } else {
@@ -1938,12 +1994,23 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, initial_pty_fd: ?i32) !void 
                         .Input => if (pty_live) try daemon.handleInput(client, msg.payload),
                         .Init => {
                             // If shell was deferred, spawn it now with the client's dimensions.
-                            if (!pty_live and msg.payload.len == @sizeOf(ipc.Resize)) {
+                            // Init payload: [Resize (4 bytes)] [optional NUL-separated command argv]
+                            if (!pty_live and msg.payload.len >= @sizeOf(ipc.Resize)) {
                                 const resize = std.mem.bytesToValue(ipc.Resize, msg.payload[0..@sizeOf(ipc.Resize)]);
                                 daemon.initial_cols = resize.cols;
                                 daemon.initial_rows = resize.rows;
                                 try term.resize(daemon.alloc, resize.cols, resize.rows);
-                                std.log.info("deferred shell spawn cols={d} rows={d}", .{ resize.cols, resize.rows });
+
+                                // Parse command from remaining payload bytes
+                                // Layout: [flags 1B] [NUL-separated command argv]
+                                const extra = msg.payload[@sizeOf(ipc.Resize)..];
+                                if (extra.len > 1) {
+                                    const flags = extra[0];
+                                    daemon.auto_restart = (flags & 0x01) != 0;
+                                    daemon.command = parseNulArgv(daemon.alloc, extra[1..]);
+                                }
+
+                                std.log.info("deferred shell spawn cols={d} rows={d} has_cmd={} auto_restart={}", .{ resize.cols, resize.rows, daemon.command != null, daemon.auto_restart });
                                 pty_fd = try daemon.spawnPty();
                                 pty_live = true;
                             }

@@ -53,7 +53,7 @@ pub fn build(b: *std.Build) void {
     {
         const run_step = b.step("run", "Run the app");
         const exe = b.addExecutable(.{
-            .name = "zmx",
+            .name = "stim-zmx",
             .root_module = exe_mod,
         });
         exe.linkLibC();
